@@ -40,7 +40,12 @@ async function createMigratedAdapter(
   return adapter;
 }
 
-function createRuntime(fact: string): AgentRuntime {
+type StageToolArguments = {
+  facts: Array<{ subject: string; fact: string }>;
+  relationships: Array<{ subject: string; predicate: string; object: string }>;
+};
+
+function createRuntime(toolArguments: StageToolArguments): AgentRuntime {
   const character: Character = {
     name: "Eliza",
     bio: ["Test"],
@@ -62,8 +67,7 @@ function createRuntime(fact: string): AgentRuntime {
           {
             name: FACTS_AND_RELATIONSHIPS_TOOL_NAME,
             arguments: {
-              facts: [{ subject: "user", fact }],
-              relationships: [],
+              ...toolArguments,
               thought: "new durable fact about the speaker",
             },
           },
@@ -89,7 +93,10 @@ describe("facts stage keeps facts written in non-Latin scripts", () => {
     ["Japanese", "私は緑茶が好きです", "ユーザーは緑茶が好きです"],
     ["English", "I like green tea.", "The user likes green tea"],
   ])("%s fact is validated and stored", async (_label, text, fact) => {
-    const runtime = createRuntime(fact);
+    const runtime = createRuntime({
+      facts: [{ subject: "user", fact }],
+      relationships: [],
+    });
     runtimes.push(runtime);
     runtime.registerDatabaseAdapter(
       await createMigratedAdapter(runtime.agentId),
@@ -138,5 +145,92 @@ describe("facts stage keeps facts written in non-Latin scripts", () => {
       count: 10,
     });
     expect(rows.map((row) => row.content.text)).toEqual([fact]);
+  });
+});
+
+describe("facts stage keeps relationships with non-Latin predicates", () => {
+  const runtimes: AgentRuntime[] = [];
+
+  afterEach(async () => {
+    await Promise.all(runtimes.splice(0).map((runtime) => runtime.stop()));
+  });
+
+  it.each([
+    ["Japanese", "好き", "好き"],
+    ["Korean", "친한 친구", "친한_친구"],
+    ["Russian", "Любит", "любит"],
+    ["English", "works with", "works_with"],
+  ])("%s predicate is written", async (_label, predicate, expected) => {
+    const relationship = { subject: "user", predicate, object: "Дмитрий" };
+    const runtime = createRuntime({
+      facts: [],
+      relationships: [relationship],
+    });
+    runtimes.push(runtime);
+    runtime.registerDatabaseAdapter(
+      await createMigratedAdapter(runtime.agentId),
+    );
+    await runtime.initialize({ skipMigrations: true });
+
+    const userId = uuidv4() as UUID;
+    const friendId = uuidv4() as UUID;
+    const roomId = uuidv4() as UUID;
+    const worldId = uuidv4() as UUID;
+    for (const [entityId, name] of [
+      [userId, "민지"],
+      [friendId, "Дмитрий"],
+    ] as const) {
+      await runtime.ensureConnection({
+        entityId,
+        roomId,
+        worldId,
+        worldName: "Home",
+        roomName: "chat",
+        userName: name,
+        name,
+        source: "discord",
+        type: ChannelType.GROUP,
+        channelId: "chat-channel",
+      });
+    }
+
+    const statement: Memory = {
+      id: uuidv4() as UUID,
+      entityId: userId,
+      agentId: runtime.agentId,
+      roomId,
+      worldId,
+      content: {
+        text: "Я дружу с Дмитрием",
+        source: "discord",
+        senderName: "민지",
+      },
+      createdAt: Date.now(),
+    };
+    await runtime.createMemory(statement, "messages");
+
+    const stage = await runFactsAndRelationshipsStage({
+      runtime,
+      message: statement,
+      state: { values: {}, data: {}, text: "" } as State,
+      extract: { facts: [], relationships: [relationship] },
+    });
+    expect(stage.parsed.thought).not.toBe("no candidates after filtering");
+    expect(stage.written.relationships).toBe(1);
+
+    const rows = await runtime.getMemories({
+      tableName: "facts",
+      roomId,
+      count: 10,
+    });
+    expect(rows.map((row) => row.content.predicate)).toEqual([expected]);
+    const edges = await runtime.getRelationships({ entityIds: [userId] });
+    expect(
+      edges.map((edge) => [
+        edge.sourceEntityId,
+        edge.targetEntityId,
+        edge.tags,
+      ]),
+    ).toEqual([[userId, friendId, [expected]]]);
   });
 });
